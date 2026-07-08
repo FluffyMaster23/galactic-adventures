@@ -1,4 +1,9 @@
 document.addEventListener('DOMContentLoaded', () => {
+    if (typeof Howl === 'undefined') {
+        console.error('Howler.js failed to load.');
+        return;
+    }
+
     // Game variables
     let playerHealth = 100;
     const mapWidth = 100;
@@ -7,14 +12,23 @@ document.addEventListener('DOMContentLoaded', () => {
     let isJumping = false;
     let isBlocking = false;
     let isSaberDrawn = false;
-    let droids = [{ id: 0, position: { x: 7, y: Math.floor(Math.random() * mapHeight) }, health: 2 }]; // First droid starts at (7, random y)
+    let droids = [];
     let gameRunning = true;
     let isMovingLeft = false;
     let isMovingRight = false;
-    let isPlayerFootstepPlaying = false;
-    let footstepInterval;
+    let footstepIndex = 0;
     let droidSpawnInterval;
-    let droidCount = 1; // Start with 1 droid
+    let totalDroidsSpawned = 0;
+    let totalDroidsKilled = 0;
+    let lastPlayerMoveTime = 0;
+    let lastDroidMoveTime = 0;
+    const INITIAL_DROID_COUNT = 3;
+    const DROID_SPAWN_INTERVAL_MS = 6000;
+    const DROID_MOVE_INTERVAL_MS = 250;
+    const PLAYER_MOVE_INTERVAL_MS = 260;
+    const MIN_SPAWN_DISTANCE_FROM_PLAYER = 20;
+    const MIN_SPAWN_DISTANCE_BETWEEN_DROIDS = 10;
+    const ORIGIN_NO_SPAWN_RADIUS = 12;
     const deathMessage = document.createElement('div');
     const coordAnnouncement = document.createElement('div'); // Coordinate display element
     let jumpDistance = 0; // Track how many steps to move during a jump
@@ -27,28 +41,86 @@ document.addEventListener('DOMContentLoaded', () => {
     document.body.appendChild(coordAnnouncement);
 
     // Audio files
-    const footstepsSounds = [new Audio('footsteps.mp3'), new Audio('footsteps2.mp3')]; // Player footsteps
-    const droidFootstepsSounds = [new Audio('footsteps.mp3'), new Audio('footsteps2.mp3')]; // Droid footsteps
+    function makeHowl(src, extraOptions = {}) {
+        return new Howl({
+            src: [src],
+            preload: true,
+            ...extraOptions
+        });
+    }
+
+    const footstepsSounds = [makeHowl('sounds/player/step1.WAV'), makeHowl('sounds/player/step2.WAV')]; // Player footsteps
     const lightsaberSwingSounds = [
-        new Audio('saberswing1.mp3'),
-        new Audio('saberswing2.mp3'),
-        new Audio('saberswing3.mp3')
+        makeHowl('sounds/weapons/saber/saberswing1.mp3'),
+        makeHowl('sounds/weapons/saber/saberswing2.mp3'),
+        makeHowl('sounds/weapons/saber/saberswing3.mp3')
     ];
-    const saberHitSounds = [new Audio('saberhit1.mp3'), new Audio('saberhit2.mp3')]; // Lightsaber hit sounds
-    const droidHitSound = new Audio('Ouch!.mp3'); // Play "Ouch!" when droid is hit
-    const droidDeathSound = new Audio('droid death.mp3'); // Play "droid death.mp3" when droid dies
-    const saberDrawSound = new Audio('drawsaber.mp3');
-    const saberLoopSound = new Audio('saberloop.mp3');
+    const saberHitSounds = [makeHowl('sounds/weapons/saber/saberhit1.mp3'), makeHowl('sounds/weapons/saber/saberhit2.mp3')]; // Lightsaber hit sounds
+    const droidSpawnSound = makeHowl('sounds/enemies/droid/roger.WAV');
+    const droidHitSound = makeHowl('sounds/enemies/droid/roger.WAV');
+    const droidDeath1Sound = makeHowl('sounds/deaths/droid/droiddeath.WAV');
+    const droidDeath2Sound = makeHowl('sounds/deaths/droid/death2.WAV');
+    const saberDrawSound = makeHowl('sounds/weapons/saber/drawsaber.mp3');
+    const saberLoopSound = makeHowl('sounds/weapons/saber/saberloop.mp3', { loop: true });
     const saberBlockSounds = [
-        new Audio('saberblock1.mp3'),
-        new Audio('saberblock2.mp3')
+        makeHowl('sounds/weapons/saber/saberblock1.mp3'),
+        makeHowl('sounds/weapons/saber/saberblock2.mp3')
     ];
-    const blasterFireSound = new Audio('blaster.mp3');
-    const playerDeathSound = new Audio('player_death.mp3');
-    const jumpSound = new Audio('jump.mp3'); // New jump sound
-    const landSound = new Audio('land.mp3'); // New landing sound
+    const blasterFireSound = makeHowl('sounds/weapons/blaster/blaster.mp3');
+    const playerDeathSound = makeHowl('sounds/deaths/droid/droiddeath.WAV');
+    const jumpSound = makeHowl('sounds/player/jump.mp3'); // New jump sound
+    const landSound = makeHowl('sounds/player/land.mp3'); // New landing sound
+    let saberLoopId = null;
+
+    const allSounds = [
+        ...footstepsSounds,
+        ...lightsaberSwingSounds,
+        ...saberHitSounds,
+        droidSpawnSound,
+        droidHitSound,
+        droidDeath1Sound,
+        droidDeath2Sound,
+        saberDrawSound,
+        saberLoopSound,
+        ...saberBlockSounds,
+        blasterFireSound,
+        playerDeathSound,
+        jumpSound,
+        landSound
+    ];
+    allSounds.forEach(sound => sound.load());
 
     const healthAnnouncement = document.getElementById('health-announcement');
+
+    // Helper to play non-positional sounds safely.
+    function playSound(sound, restart = true) {
+        if (!sound) return null;
+        if (restart && sound.playing()) {
+            sound.stop();
+        }
+        if (!restart && sound.playing()) {
+            return null;
+        }
+        return sound.play();
+    }
+
+    function startSaberLoop() {
+        if (saberLoopId !== null && saberLoopSound.playing(saberLoopId)) {
+            return;
+        }
+
+        saberLoopId = saberLoopSound.play();
+        saberLoopSound.loop(true, saberLoopId);
+    }
+
+    function stopSaberLoop() {
+        if (saberLoopId !== null) {
+            saberLoopSound.stop(saberLoopId);
+            saberLoopId = null;
+            return;
+        }
+        saberLoopSound.stop();
+    }
 
     // Update health display
     function updateHealthDisplay() {
@@ -61,7 +133,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Stop the lightsaber loop if it's still playing
         if (isSaberDrawn) {
-            saberLoopSound.pause();
+            stopSaberLoop();
         }
 
         // Announce that health is 0 first, then show the death message
@@ -99,94 +171,102 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    // Draw/Sheathe lightsaber with key "1"
+    // Toggle lightsaber with key "1" (space can also draw it)
     document.addEventListener('keydown', (event) => {
         if (!gameRunning) return; // Stop actions when the game is over
 
         if (event.key === '1') {
             if (!isSaberDrawn) {
-                saberDrawSound.play();
-                saberLoopSound.loop = true;
-                saberLoopSound.play();
+                playSound(saberDrawSound);
+                startSaberLoop();
                 isSaberDrawn = true;
             } else {
-                saberLoopSound.pause();
+                stopSaberLoop();
                 isSaberDrawn = false;
+                isBlocking = false;
             }
         }
     });
 
-    // Function to play continuous footstep sounds for the player (alternating between footsteps.mp3 and footsteps2.mp3)
-    function playPlayerFootsteps() {
-        // Check if the player is at coordinates (0,0) or (100,100), and don't play footsteps if true
-        if ((playerPosition.x === 0 && playerPosition.y === 0) || 
-            (playerPosition.x === 100 && playerPosition.y === 100)) {
-            stopPlayerFootsteps(); // Ensure no footstep sound is playing
+    // Play exactly one footstep per movement step.
+    function playPlayerFootstepStep() {
+        const sound = footstepsSounds[footstepIndex % 2];
+        playSound(sound);
+        footstepIndex++;
+    }
+
+    function stopPlayerFootsteps() {
+        // Discrete step playback does not need interval cleanup.
+    }
+
+    function movePlayerStep(direction) {
+        if (direction === -1) {
+            playerPosition.x = Math.max(0, playerPosition.x - 1);
+            playPlayerFootstepStep();
             return;
         }
 
-        if (!isPlayerFootstepPlaying && gameRunning) {
-            isPlayerFootstepPlaying = true;
-            let footstepIndex = 0;
-            footstepInterval = setInterval(() => {
-                const sound = footstepsSounds[footstepIndex % 2]; // Alternate between footsteps.mp3 and footsteps2.mp3
-                sound.currentTime = 0; // Reset sound
-                sound.play();
-                footstepIndex++;
-            }, 200); // Play footsteps rapidly to simulate continuous walking/running
+        if (direction === 1) {
+            if (!isJumping) {
+                playerPosition.x = Math.min(mapWidth, playerPosition.x + 1);
+                playPlayerFootstepStep();
+            } else {
+                jumpDistance++;
+            }
         }
     }
 
-    // Stop player footsteps when keys are released
-    function stopPlayerFootsteps() {
-        if (isPlayerFootstepPlaying) {
-            clearInterval(footstepInterval);
-            isPlayerFootstepPlaying = false;
-        }
-    }
-
-    // Function to play continuous footstep sounds for droids (alternating between footsteps.mp3 and footsteps2.mp3)
-    function playDroidFootsteps(droidId) {
-        let droidFootstepIndex = 0;
-        const droidFootstepInterval = setInterval(() => {
-            if (!gameRunning) return;
-            const sound = droidFootstepsSounds[droidFootstepIndex % 2]; // Alternate between footsteps.mp3 and footsteps2.mp3
-            playSoundFromDroid(droids[droidId], sound);
-            droidFootstepIndex++;
-        }, 300); // Droids walk slower than the player
-        droids[droidId].footstepInterval = droidFootstepInterval; // Save the interval for clearing later if needed
+    function getDynamicDroidPopulationTarget() {
+        if (totalDroidsKilled < 10) return 2;
+        if (totalDroidsKilled < 20) return 3;
+        return 5;
     }
 
     // Function to prevent droids from piling up and ensure unique random positions
     function getRandomPosition() {
         let position;
-        let isTooClose;
+        let isTooCloseToDroid;
+        let isTooCloseToPlayer;
+        let isInOriginNoSpawnZone;
         do {
-            position = { x: Math.random() * 10 + 90, y: Math.random() * mapHeight }; // Always spawn droids from the right (x > 90)
-            isTooClose = droids.some(droid => Math.abs(droid.position.x - position.x) < 15 && Math.abs(droid.position.y - position.y) < 15); 
-            // Ensure new droids don't spawn too close to existing ones
-        } while (isTooClose);
+            // Spawn anywhere in the world while respecting player distance.
+            position = { x: Math.random() * mapWidth, y: Math.random() * mapHeight };
+            isTooCloseToDroid = droids.some(droid => {
+                const dx = droid.position.x - position.x;
+                const dy = droid.position.y - position.y;
+                return Math.sqrt(dx * dx + dy * dy) < MIN_SPAWN_DISTANCE_BETWEEN_DROIDS;
+            });
+
+            const playerDx = playerPosition.x - position.x;
+            const playerDy = playerPosition.y - position.y;
+            isTooCloseToPlayer = Math.sqrt(playerDx * playerDx + playerDy * playerDy) < MIN_SPAWN_DISTANCE_FROM_PLAYER;
+
+            const originDx = position.x;
+            const originDy = position.y;
+            isInOriginNoSpawnZone = Math.sqrt(originDx * originDx + originDy * originDy) < ORIGIN_NO_SPAWN_RADIUS;
+        } while (isTooCloseToDroid || isTooCloseToPlayer || isInOriginNoSpawnZone);
         return position;
     }
 
     // Initialize droids - Spawn them at random positions across the map
     function spawnDroid() {
+        totalDroidsSpawned += 1;
+        const isBoss = totalDroidsSpawned % 10 === 0;
         const droid = {
-            id: droids.length,
+            id: totalDroidsSpawned,
             position: getRandomPosition(), // Random position on the right side of the map
-            health: 2
+            health: isBoss ? 2 : 1,
+            isBoss
         };
         droids.push(droid);
-        playDroidFootsteps(droid.id); // Start droid footsteps
-        droidFireAtRandom(droid); // Make this droid fire at random intervals
-    }
 
-    // Introduce more droids after each wave
-    function introduceNextWave() {
-        droidCount++; // Increase the droid count
-        for (let i = 0; i < droidCount; i++) {
-            spawnDroid(); // Spawn the next wave of droids
+        playSoundFromDroid(droid, droidSpawnSound); // Play roger when any droid spawns
+
+        if (droid.isBoss) {
+            playSoundFromDroid(droid, droidDeath2Sound); // Play death2 when boss appears
         }
+
+        droidFireAtRandom(droid); // Make this droid fire at random intervals
     }
 
     // Make each droid fire at random intervals (between 2 and 5 seconds)
@@ -202,26 +282,31 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (playerHealth <= 0) {
                         playerHealth = 0;
                         updateHealthDisplay();
-                        playerDeathSound.play();
+                        playSound(playerDeathSound);
                         gameOver(); // End game when health reaches 0
                     }
                 } else {
                     const blockSound = saberBlockSounds[Math.floor(Math.random() * saberBlockSounds.length)];
-                    blockSound.play(); // Play blocking sound
+                    playSound(blockSound); // Play blocking sound
                 }
 
-                const blasterClone = blasterFireSound.cloneNode(); // Clone to avoid audio overlap
-                playSoundFromDroid(droid, blasterClone); // Play independent blaster fire for each droid with panning
+                playSoundFromDroid(droid, blasterFireSound); // Play independent blaster fire for each droid with panning
             }
         }, fireInterval);
     }
 
-    // Continuous droid spawning after the first one at random intervals and random positions
+    // Continuous droid spawning with slower pacing and kill-based population scaling.
     function startSpawningDroids() {
-        spawnDroid(); // Spawn the first droid immediately
+        for (let i = 0; i < INITIAL_DROID_COUNT; i++) {
+            spawnDroid();
+        }
+
         droidSpawnInterval = setInterval(() => {
-            spawnDroid(); // Spawn droids at regular intervals
-        }, 10000); // Every 10 seconds, spawn new droids
+            const targetPopulation = getDynamicDroidPopulationTarget();
+            if (droids.length < targetPopulation) {
+                spawnDroid();
+            }
+        }, DROID_SPAWN_INTERVAL_MS);
     }
 
     // Calculate volume based on distance between player and droid
@@ -232,9 +317,16 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Calculate pan (stereo effect) based on droid's position relative to player
-    function calculatePan(droidPosition, playerPosition) {
-        const pan = (droidPosition.x - playerPosition.x) / mapWidth;
-        return Math.max(-1, Math.min(1, pan)); // Ensure pan is between -1 (left) and 1 (right)
+    function calculatePan(droidPosition, playerPosition, panBoost = 1) {
+        const rawPan = ((droidPosition.x - playerPosition.x) / (mapWidth / 2)) * panBoost;
+        if (Math.abs(rawPan) < 0.05) {
+            return 0;
+        }
+
+        // Keep side positioning obvious: left sounds left, right sounds right.
+        const minAudiblePan = 0.35;
+        const signedPan = Math.sign(rawPan) * Math.max(minAudiblePan, Math.abs(rawPan));
+        return Math.max(-1, Math.min(1, signedPan));
     }
 
     // Play sound from the droid's position with stereo effect
@@ -243,12 +335,16 @@ document.addEventListener('DOMContentLoaded', () => {
             Math.pow(droid.position.x - playerPosition.x, 2) +
             Math.pow(droid.position.y - playerPosition.y, 2)
         );
-        sound.volume = calculateVolume(distance);
-
-        const pan = calculatePan(droid.position, playerPosition);
-        sound.pan = pan; // Set stereo panning
-
-        sound.play();
+        const isBlaster = sound === blasterFireSound;
+        const isSpawnCue = sound === droidSpawnSound;
+        const pan = calculatePan(droid.position, playerPosition, isBlaster ? 2.2 : 1.4);
+        const id = sound.play();
+        const baseVolume = calculateVolume(distance);
+        const finalVolume = isBlaster ? Math.max(0.45, baseVolume) : (isSpawnCue ? Math.max(0.4, baseVolume) : baseVolume);
+        sound.volume(finalVolume, id);
+        // Spatial positioning provides a stronger left/right placement cue than stereo alone.
+        sound.pos(pan * 3, 0, -0.5, id);
+        sound.stereo(pan, id); // Set stereo panning
     }
 
     // Handle droid movement and actions
@@ -265,79 +361,90 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Check if droid falls into the abyss
         if (droid.position.x < 0 || droid.position.x > mapWidth || droid.position.y < 0 || droid.position.y > mapHeight) {
+            clearInterval(droid.fireInterval);
             droids = droids.filter(d => d !== droid);
-            playSoundFromDroid(droid, droidDeathSound); // Play droid death sound
-            clearInterval(droid.footstepInterval); // Stop the footstep sounds for the droid
+            const deathSound = droid.isBoss ? droidDeath2Sound : droidDeath1Sound;
+            playSoundFromDroid(droid, deathSound); // Play droid death sound
         }
     }
 
     // Handle player actions and interactions
     function handlePlayerActions(event) {
         if (!gameRunning) return; // Actions are only possible if the game is running and the player isn't dead
-        if (!isSaberDrawn) return; // Actions are only possible if the saber is drawn
 
         switch (event.key) {
             case 'ArrowLeft':
+                event.preventDefault();
                 isMovingLeft = true;
+                if (event.repeat) {
+                    break;
+                }
                 if (!isJumping) {
-                    playerPosition.x = Math.max(0, playerPosition.x - 1); // Ensure player doesn't go out of bounds
-                    playPlayerFootsteps(); // Play footstep when moving left
+                    movePlayerStep(-1);
+                    lastPlayerMoveTime = performance.now();
                 }
                 break;
             case 'ArrowRight':
-                if (!isJumping) {
-                    playerPosition.x = Math.min(mapWidth, playerPosition.x + 1); // Ensure player doesn't go out of bounds
-                    playPlayerFootsteps(); // Play footstep when moving right
-                } else {
-                    // Accumulate distance moved while jumping (but no actual movement)
-                    jumpDistance++;
+                event.preventDefault();
+                isMovingRight = true;
+                if (event.repeat) {
+                    break;
                 }
+                movePlayerStep(1);
+                lastPlayerMoveTime = performance.now();
                 break;
             case 'ArrowUp': // Use arrow up for jumping only
                 if (!isJumping) {
                     isJumping = true;
                     jumpDistance = 0; // Reset the jump distance counter
-                    jumpSound.play();
+                    playSound(jumpSound);
 
                     // Automatically land after 2 seconds
                     setTimeout(() => {
                         playerPosition.x = Math.min(mapWidth, playerPosition.x + jumpDistance); // Move the player based on jump distance
                         jumpDistance = 0; // Reset the jump distance counter
                         isJumping = false;
-                        landSound.play(); // Play landing sound
+                        playSound(landSound); // Play landing sound
                     }, 2000); // 2-second air time
                 }
                 break;
             case ' ': // Spacebar for lightsaber swing
+                event.preventDefault();
+                if (!isSaberDrawn) {
+                    playSound(saberDrawSound);
+                    startSaberLoop();
+                    isSaberDrawn = true;
+                    isBlocking = false;
+                    return;
+                }
                 if (event.repeat) {
                     isBlocking = true;
-                    saberLoopSound.play(); // Continue saber loop sound while blocking
+                    startSaberLoop(); // Keep saber hum active while blocking
                 } else {
                     isBlocking = false;
                     let droidHit = false;
                     // Play saber swing sound
                     const swingSound = lightsaberSwingSounds[Math.floor(Math.random() * lightsaberSwingSounds.length)];
-                    swingSound.play();
+                    playSound(swingSound);
 
                     droids.forEach(droid => {
                         // Make sure droids are hittable within 5 steps distance
                         if (Math.abs(droid.position.x - playerPosition.x) <= 5 && Math.abs(droid.position.y - playerPosition.y) <= 5) {
                             // Play saber hit sound and then check if the droid is hit
                             const hitSound = saberHitSounds[Math.floor(Math.random() * saberHitSounds.length)];
-                            hitSound.play(); // Play saber hit sound first
+                            playSound(hitSound); // Play saber hit sound first
                             setTimeout(() => {
                                 droid.health -= 1;
                                 droidHit = true;
                                 if (droid.health === 1) {
-                                    playSoundFromDroid(droid, droidHitSound); // Play "Ouch!" when health drops to 1
+                                    playSoundFromDroid(droid, droidHitSound); // Play a droid hit cue when health drops to 1
                                 }
                                 if (droid.health <= 0) {
-                                    playSoundFromDroid(droid, droidDeathSound); // Droid death sound when health is 0
+                                    const deathSound = droid.isBoss ? droidDeath2Sound : droidDeath1Sound;
+                                    playSoundFromDroid(droid, deathSound); // Droid death sound when health is 0
+                                    clearInterval(droid.fireInterval);
+                                    totalDroidsKilled += 1;
                                     droids = droids.filter(d => d !== droid); // Remove droid from the game
-                                    clearInterval(droid.footstepInterval); // Stop the droid's footsteps
-                                    if (droids.length === 0 && gameRunning) {
-                                        introduceNextWave(); // Introduce the next wave when all droids are killed
-                                    }
                                 }
                             }, 50); // Delay for the saber hit sound to finish before checking health
                         }
@@ -349,8 +456,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Stop footsteps when the arrow keys are released
     function handlePlayerActionsKeyUp(event) {
-        if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        if (event.key === 'ArrowLeft') {
+            isMovingLeft = false;
             stopPlayerFootsteps();
+        }
+        if (event.key === 'ArrowRight') {
+            isMovingRight = false;
+            stopPlayerFootsteps();
+        }
+        if (event.key === ' ') {
+            isBlocking = false;
         }
     }
 
@@ -358,11 +473,26 @@ document.addEventListener('DOMContentLoaded', () => {
     function update() {
         if (!gameRunning) return;
 
-        droids.forEach(droid => moveDroid(droid));
+        const now = performance.now();
+
+        if (now - lastPlayerMoveTime >= PLAYER_MOVE_INTERVAL_MS) {
+            if (isMovingLeft && !isMovingRight && !isJumping) {
+                movePlayerStep(-1);
+            }
+            if (isMovingRight && !isMovingLeft) {
+                movePlayerStep(1);
+            }
+            lastPlayerMoveTime = now;
+        }
+
+        if (now - lastDroidMoveTime >= DROID_MOVE_INTERVAL_MS) {
+            droids.forEach(droid => moveDroid(droid));
+            lastDroidMoveTime = now;
+        }
 
         // Check if player falls into the abyss
         if (playerPosition.y < 0 || playerPosition.y > mapHeight) {
-            playerDeathSound.play();
+            playSound(playerDeathSound);
             gameOver(); // End the game when the player falls into the abyss
         }
 
