@@ -22,10 +22,13 @@ document.addEventListener('DOMContentLoaded', () => {
     let totalDroidsKilled = 0;
     let lastPlayerMoveTime = 0;
     let lastDroidMoveTime = 0;
+    let lastSaberSwingTime = -Infinity;
+    let saberSwingIndex = 0;
     const INITIAL_DROID_COUNT = 3;
     const DROID_SPAWN_INTERVAL_MS = 6000;
     const DROID_MOVE_INTERVAL_MS = 250;
     const PLAYER_MOVE_INTERVAL_MS = 260;
+    const SABER_SWING_COOLDOWN_MS = 2000;
     const MIN_SPAWN_DISTANCE_FROM_PLAYER = 20;
     const MIN_SPAWN_DISTANCE_BETWEEN_DROIDS = 10;
     const ORIGIN_NO_SPAWN_RADIUS = 12;
@@ -71,6 +74,17 @@ document.addEventListener('DOMContentLoaded', () => {
     const jumpSound = makeHowl('sounds/player/jump.mp3'); // New jump sound
     const landSound = makeHowl('sounds/player/land.mp3'); // New landing sound
     let saberLoopId = null;
+    const SABER_LOOP_SPRITE = 'humLoop';
+    let hasSaberLoopSprite = false;
+
+    saberLoopSound.once('load', () => {
+        // MP3 files can have encoder padding; trimming loop edges makes hum feel continuous.
+        const durationMs = Math.floor(saberLoopSound.duration() * 1000);
+        const trimMs = 60;
+        const spriteDuration = Math.max(300, durationMs - (trimMs * 2));
+        saberLoopSound._sprite[SABER_LOOP_SPRITE] = [trimMs, spriteDuration, true];
+        hasSaberLoopSprite = true;
+    });
 
     const allSounds = [
         ...footstepsSounds,
@@ -106,6 +120,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function startSaberLoop() {
         if (saberLoopId !== null && saberLoopSound.playing(saberLoopId)) {
+            return;
+        }
+
+        if (hasSaberLoopSprite) {
+            saberLoopId = saberLoopSound.play(SABER_LOOP_SPRITE);
             return;
         }
 
@@ -421,10 +440,17 @@ document.addEventListener('DOMContentLoaded', () => {
                     isBlocking = true;
                     startSaberLoop(); // Keep saber hum active while blocking
                 } else {
+                    const now = performance.now();
+                    if (now - lastSaberSwingTime < SABER_SWING_COOLDOWN_MS) {
+                        break;
+                    }
+
                     isBlocking = false;
                     let droidHit = false;
                     // Play saber swing sound
-                    const swingSound = lightsaberSwingSounds[Math.floor(Math.random() * lightsaberSwingSounds.length)];
+                    const swingSound = lightsaberSwingSounds[saberSwingIndex % lightsaberSwingSounds.length];
+                    saberSwingIndex += 1;
+                    lastSaberSwingTime = now;
                     playSound(swingSound);
 
                     droids.forEach(droid => {
