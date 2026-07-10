@@ -47,16 +47,16 @@ const ORIGIN_NO_SPAWN_RADIUS = 12;
 const INITIAL_FRONT_SPAWN_BLOCK_Y = 8;
 const MIN_DROID_SPAWN_X = 10;
 const FOOTSTEP_PAN_AMOUNT = 1;
-const STEREO_MAX_DISTANCE = 10;
-const STEREO_PAN_STRENGTH = 2.25;
-const STEREO_RIGHT_BIAS = 0.35;
+const STEREO_MAX_DISTANCE = 6;
+const STEREO_PAN_STRENGTH = 3;
+const STEREO_HARD_PAN_THRESHOLD = 1.5;
 const droidApproachMix = {
-    minVolume: 0.12,
-    blasterMinVolume: 0.35,
-    distanceRange: 40,
-    fadeOutRange: 24,
-    droidBoost: 1.5,
-    blasterBoost: 1.8
+    minVolume: 0.02,
+    blasterMinVolume: 0.08,
+    distanceRange: 16,
+    fadeOutRange: 18,
+    droidBoost: 1,
+    blasterBoost: 1.2
 };
 const deathMessage = document.createElement('div');
 const coordAnnouncement = document.createElement('div'); // Coordinate display element
@@ -191,7 +191,14 @@ function updateTrackedSound(playback, position, options = {}) {
 function playSpatialSoundAtPosition(sound, position, options = {}) {
     if (!sound) return null;
 
-    const { loop = false, playbackRate = 1, volumeMultiplier = 1, minVolumeFloor = 0 } = options;
+    const {
+        loop = false,
+        playbackRate = 1,
+        volumeMultiplier = 1,
+        minVolumeFloor = 0,
+        track = true,
+        droid = null
+    } = options;
     const id = sound.play();
 
     if (id === null || id === undefined) {
@@ -202,12 +209,17 @@ function playSpatialSoundAtPosition(sound, position, options = {}) {
     sound.rate(playbackRate, id);
     updateTrackedSound({ sound, id }, position, { volumeMultiplier, minVolumeFloor });
 
-    return { sound, id };
-}
+    if (track) {
+        activeSpatialAudioInstances.push({
+            sound,
+            id,
+            position,
+            droid,
+            options: { volumeMultiplier, minVolumeFloor }
+        });
+    }
 
-function trackSpatialLoop(droid, playback, options = {}) {
-    if (!playback) return;
-    activeSpatialAudioInstances.push({ droid, sound: playback.sound, id: playback.id, options });
+    return { sound, id };
 }
 
 function startSaberLoop() {
@@ -551,11 +563,9 @@ function spawnDroid(options = {}) {
         droid.stepLoop = playSpatialSoundAtPosition(droid.stepSound, droid.position, {
             loop: true,
             playbackRate: 1,
-            volumeMultiplier: droidApproachMix.droidBoost
+            volumeMultiplier: droidApproachMix.droidBoost,
+            droid
         });
-        if (droid.stepLoop) {
-            trackSpatialLoop(droid, droid.stepLoop, { volumeMultiplier: droidApproachMix.droidBoost });
-        }
     }
 
     if (droid.isBoss) {
@@ -685,11 +695,17 @@ function getRelativePositionToPlayer(objectPosition) {
 
 function calculatePan(listenerX, soundX, maximumDistance = STEREO_MAX_DISTANCE) {
     const relativeX = soundX - listenerX;
-    let pan = (relativeX / maximumDistance) * STEREO_PAN_STRENGTH;
 
-    if (relativeX > 0) {
-        pan += STEREO_RIGHT_BIAS;
+    if (relativeX >= STEREO_HARD_PAN_THRESHOLD) {
+        return 1;
     }
+    if (relativeX <= -STEREO_HARD_PAN_THRESHOLD) {
+        return -1;
+    }
+
+    const normalized = Math.max(-1, Math.min(1, relativeX / maximumDistance));
+    // Non-linear shaping pushes moderate offsets further into the side channels.
+    let pan = Math.sign(normalized) * Math.pow(Math.abs(normalized), 0.65) * STEREO_PAN_STRENGTH;
 
     return Math.max(-1, Math.min(1, pan));
 }
@@ -727,12 +743,21 @@ function updateTrackedDroidPanning() {
     if (!activeSpatialAudioInstances.length) return;
 
     activeSpatialAudioInstances = activeSpatialAudioInstances.filter(entry => {
-        if (!droids.includes(entry.droid)) {
+        if (!entry.sound.playing(entry.id)) {
+            return false;
+        }
+
+        if (entry.droid && !droids.includes(entry.droid)) {
             stopTrackedSound(entry);
             return false;
         }
 
-        updateTrackedSound(entry, entry.droid.position, entry.options);
+        const trackedPosition = entry.droid ? entry.droid.position : entry.position;
+        if (!trackedPosition) {
+            return false;
+        }
+
+        updateTrackedSound(entry, trackedPosition, entry.options);
         return true;
     });
 }
