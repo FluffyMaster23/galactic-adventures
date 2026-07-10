@@ -191,14 +191,14 @@ function updateTrackedSound(playback, position, options = {}) {
     const { volumeMultiplier = 1, minVolumeFloor = 0 } = options;
     playback.sound.volume(getVolumeForPosition(position, { volumeMultiplier, minVolumeFloor }), playback.id);
 
+    const pan = getPanForPosition(position);
+    if (typeof playback.sound.stereo === 'function') {
+        playback.sound.stereo(pan, playback.id);
+    }
+
     if (typeof playback.sound.pos === 'function') {
         const point = getSpatialPointForPosition(position);
         playback.sound.pos(point.x, point.y, point.z, playback.id);
-        return;
-    }
-
-    if (typeof playback.sound.stereo === 'function') {
-        playback.sound.stereo(getPanForPosition(position), playback.id);
     }
 }
 
