@@ -239,6 +239,85 @@ function stopSaberLoop() {
     saberLoopSound.stop();
 }
 
+function getStereoDiagnostics() {
+    const hasHowlerStereo = typeof menuMoveSound.stereo === 'function';
+    const hasWebAudio = !!(window.AudioContext || window.webkitAudioContext);
+    const destinationChannels = hasWebAudio && Howler && Howler.ctx && Howler.ctx.destination
+        ? Howler.ctx.destination.maxChannelCount
+        : 0;
+
+    return {
+        hasHowlerStereo,
+        hasWebAudio,
+        destinationChannels
+    };
+}
+
+function playNativeStereoPulse(pan, startDelayMs = 0) {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) {
+        return false;
+    }
+
+    const ctx = Howler && Howler.ctx ? Howler.ctx : new AudioCtx();
+    const now = ctx.currentTime;
+    const startTime = now + (startDelayMs / 1000);
+    const duration = 0.18;
+
+    const oscillator = ctx.createOscillator();
+    oscillator.type = 'square';
+    oscillator.frequency.setValueAtTime(660, startTime);
+
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.0001, startTime);
+    gain.gain.exponentialRampToValueAtTime(0.28, startTime + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, startTime + duration);
+
+    const panner = ctx.createStereoPanner();
+    panner.pan.setValueAtTime(pan, startTime);
+
+    oscillator.connect(gain);
+    gain.connect(panner);
+    panner.connect(ctx.destination);
+
+    oscillator.start(startTime);
+    oscillator.stop(startTime + duration + 0.02);
+
+    return true;
+}
+
+function playStereoTestTone() {
+    const diagnostics = getStereoDiagnostics();
+
+    if (diagnostics.hasWebAudio) {
+        const leftPlayed = playNativeStereoPulse(-1, 0);
+        const rightPlayed = playNativeStereoPulse(1, 300);
+
+        if (leftPlayed && rightPlayed) {
+            announceMenu(`Stereo test: left then right. Output channels: ${diagnostics.destinationChannels || 'unknown'}`);
+            return;
+        }
+    }
+
+    // Fallback path if Web Audio stereo is unavailable.
+    const testSound = menuMoveSound;
+    const leftId = testSound.play();
+    if (leftId !== null && leftId !== undefined && typeof testSound.stereo === 'function') {
+        testSound.volume(0.7, leftId);
+        testSound.stereo(-1, leftId);
+    }
+
+    setTimeout(() => {
+        const rightId = testSound.play();
+        if (rightId !== null && rightId !== undefined && typeof testSound.stereo === 'function') {
+            testSound.volume(0.7, rightId);
+            testSound.stereo(1, rightId);
+        }
+    }, 300);
+
+    announceMenu(`Stereo test fallback. WebAudio: ${diagnostics.hasWebAudio ? 'on' : 'off'}, Howler stereo: ${diagnostics.hasHowlerStereo ? 'on' : 'off'}`);
+}
+
 // Update health display
 function updateHealthDisplay() {
     healthAnnouncement.textContent = `Health: ${playerHealth}`;
@@ -419,6 +498,15 @@ function gameOver() {
     document.removeEventListener('keydown', handlePlayerActions);
     document.removeEventListener('keyup', handlePlayerActionsKeyUp);
 }
+
+// Announce health when H is pressed
+document.addEventListener('keydown', (event) => {
+    if (event.repeat) return;
+    if (event.key !== 't' && event.key !== 'T') return;
+
+    event.preventDefault();
+    playStereoTestTone();
+});
 
 // Announce health when H is pressed
 document.addEventListener('keydown', (event) => {
