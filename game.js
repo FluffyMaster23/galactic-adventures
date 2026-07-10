@@ -19,6 +19,7 @@ let droids = [];
 let gameRunning = true;
 let isMovingLeft = false;
 let isMovingRight = false;
+let lastHorizontalIntent = 1;
 let footstepIndex = 0;
 let droidSpawnInterval;
 let droidInitialSpawnTimeout;
@@ -30,21 +31,30 @@ let lastSaberSwingTime = -Infinity;
 const INITIAL_DROID_COUNT = 2;
 const MAX_ACTIVE_DROIDS = 2;
 const DROID_SPAWN_INTERVAL_MS = 6000;
-const DROID_MOVE_INTERVAL_MS = 250;
-const PLAYER_MOVE_INTERVAL_MS = 250;
+const DROID_MOVE_INTERVAL_MS = 120;
+const PLAYER_MOVE_INTERVAL_MS = 160;
 const SABER_SWING_COOLDOWN_MS = 550;
-const JUMP_AIR_TIME_MS = 900;
-const JUMP_FORWARD_STEPS = 2;
+const JUMP_AIR_TIME_MS = 600;
+const JUMP_FORWARD_STEPS = 3;
+const JUMP_HEIGHT_Y = 2;
 const JUMP_DODGE_GRACE_MS = 700;
+const JUMP_PASS_THROUGH_DISTANCE = 4;
+const JUMP_EXTRA_CLEARANCE_STEPS = 1;
+const DROID_POST_PASS_LEFT_MS = 450;
+const DROID_JUMP_EVADE_LOCK_MS = 1400;
 const DROID_MIN_FIRE_INTERVAL_MS = 330;
 const DROID_MAX_FIRE_INTERVAL_MS = 850;
 const DROID_BLASTER_RANGE_X = 5;
 const DROID_BLASTER_RANGE_Y = 0;
+const DROID_DISCOVERY_DISTANCE = 9;
+const DROID_CLOSE_DISTANCE = 8;
+const DROID_MOVING_AWAY_DISTANCE = 8;
+const DROID_MOVING_AWAY_DELTA = 0.75;
 const DROID_BLASTER_TRAVEL_FEET = 5;
 const DROID_BLASTER_TRAVEL_MS_PER_FOOT = 120;
 const DROID_STEP_INTERVAL_MS = 720;
-const DROID_BASE_MOVE_SPEED = 1;
-const DROID_FIRST_HUNTER_SPEED = 1.05;
+const DROID_BASE_MOVE_SPEED = 0.45;
+const DROID_FIRST_HUNTER_SPEED = 0.6;
 const DROID_CHASE_DELAY_MS = 9000;
 const MIN_SPAWN_DISTANCE_FROM_PLAYER = 12;
 const MIN_SPAWN_DISTANCE_BETWEEN_DROIDS = 10;
@@ -52,9 +62,10 @@ const ORIGIN_NO_SPAWN_RADIUS = 12;
 const INITIAL_FRONT_SPAWN_BLOCK_Y = 8;
 const MIN_DROID_SPAWN_X = 10;
 const FOOTSTEP_PAN_AMOUNT = 1;
-const STEREO_MAX_DISTANCE = 10;
+const STEREO_MAX_DISTANCE = 8;
 const DROID_VOICE_MIN_VOLUME = 0.28;
 const DROID_VOICE_BOOST = 2;
+const SABER_LOOP_TAIL_TRIM_SECONDS = 0.95;
 // Disabled by default: HTMLMediaElement playback can be blocked for timer/spawn sounds.
 const ENABLE_NATIVE_SPATIAL_FALLBACK = false;
 const droidApproachMix = {
@@ -67,10 +78,14 @@ const droidApproachMix = {
 };
 const deathMessage = document.createElement('div');
 const coordAnnouncement = document.createElement('div'); // Coordinate display element
+const droidStatusAnnouncement = document.createElement('div');
 let jumpDistance = 0; // Track how many steps to move during a jump
 let lastJumpLandTime = -Infinity;
 let jumpStartTime = 0;
 let jumpStartX = 0;
+let jumpDirection = 1;
+let droidProximityState = 'none';
+let lastNearestDroidDistance = null;
 const menuElement = document.getElementById('menu');
 const menuAnnouncement = document.getElementById('menu-announcement');
 const menuModel = {
@@ -91,6 +106,19 @@ coordAnnouncement.style.fontSize = '1em';
 coordAnnouncement.style.color = 'blue';
 coordAnnouncement.setAttribute('aria-live', 'polite'); // Announce text changes to screen readers
 document.body.appendChild(coordAnnouncement);
+
+droidStatusAnnouncement.id = 'droid-status-announcement';
+droidStatusAnnouncement.setAttribute('aria-live', 'polite');
+droidStatusAnnouncement.style.position = 'absolute';
+droidStatusAnnouncement.style.width = '1px';
+droidStatusAnnouncement.style.height = '1px';
+droidStatusAnnouncement.style.padding = '0';
+droidStatusAnnouncement.style.margin = '-1px';
+droidStatusAnnouncement.style.overflow = 'hidden';
+droidStatusAnnouncement.style.clip = 'rect(0, 0, 0, 0)';
+droidStatusAnnouncement.style.whiteSpace = 'nowrap';
+droidStatusAnnouncement.style.border = '0';
+document.body.appendChild(droidStatusAnnouncement);
 
 // Audio files
 const footstepsSounds = [
@@ -115,7 +143,7 @@ const droidHitSound = new Howl({ src: ['sounds/enemies/droid/roger.WAV'], preloa
 const droidDeath1Sound = new Howl({ src: ['sounds/deaths/droid/droiddeath.WAV'], preload: true });
 const droidDeath2Sound = new Howl({ src: ['sounds/deaths/droid/death2.WAV'], preload: true });
 const saberDrawSound = new Howl({ src: ['sounds/weapons/saber/drawsaber.wav'], preload: true });
-const saberLoopSound = new Howl({ src: ['sounds/weapons/saber/saberloop.wav'], preload: true, loop: true });
+const saberLoopSound = new Howl({ src: ['sounds/weapons/saber/saberloop.ogg'], preload: true, loop: true });
 const saberBlockSounds = [
     new Howl({ src: ['sounds/weapons/saber/saberblock1.wav'], preload: true }),
     new Howl({ src: ['sounds/weapons/saber/saberblock2.wav'], preload: true })
@@ -436,6 +464,17 @@ function startSaberLoop() {
     if (saberLoopId !== null && saberLoopSound.playing(saberLoopId)) {
         return;
     }
+
+    // Build a sprite that trims trailing silence so the hum loops seamlessly.
+    const fullDuration = saberLoopSound.duration();
+    if (fullDuration > 0) {
+        const spriteDurationMs = Math.max(200, Math.floor((fullDuration - SABER_LOOP_TAIL_TRIM_SECONDS) * 1000));
+        saberLoopSound._sprite.saber_hum_loop = [0, spriteDurationMs, true];
+        saberLoopId = saberLoopSound.play('saber_hum_loop');
+        return;
+    }
+
+    // Fallback for early startup before duration metadata is ready.
     saberLoopId = saberLoopSound.play();
     saberLoopSound.loop(true, saberLoopId);
 }
@@ -731,6 +770,7 @@ function movePlayerStep(direction) {
         const nextX = Math.max(0, playerPosition.x - 1);
         if (nextX !== playerPosition.x) {
             playerPosition.x = nextX;
+            clampPlayerPosition();
             playPlayerFootstepStep();
         }
         return;
@@ -739,6 +779,7 @@ function movePlayerStep(direction) {
     if (direction === 1) {
         if (!isJumping) {
             playerPosition.x = Math.min(mapWidth, playerPosition.x + 1);
+            clampPlayerPosition();
             playPlayerFootstepStep();
         }
     }
@@ -807,9 +848,10 @@ function spawnDroid(options = {}) {
         stepSound,
         stepLoop: null,
         direction: -1,
-        moveProgress: 0,
         moveSpeed: totalDroidsSpawned === 1 ? DROID_FIRST_HUNTER_SPEED : DROID_BASE_MOVE_SPEED,
-        lostTargetStartTime: null
+        lostTargetStartTime: null,
+        forcedDirectionUntil: 0,
+        evadeLockUntil: 0
     };
     droids.push(droid);
 
@@ -828,6 +870,9 @@ function spawnDroid(options = {}) {
         });
     }
 
+    // Start moving immediately so the first droid footstep loop has instant motion feedback.
+    moveDroid(droid);
+
     if (droid.isBoss) {
         playSpatialSoundAtPosition(droidDeath2Sound, droid.position, {
             volumeMultiplier: droidApproachMix.droidBoost,
@@ -842,6 +887,100 @@ function getDistance(a, b) {
     const dx = a.x - b.x;
     const dy = a.y - b.y;
     return Math.sqrt(dx * dx + dy * dy);
+}
+
+function clampPlayerPosition() {
+    playerPosition.x = Math.max(0, Math.min(mapWidth, playerPosition.x));
+    playerPosition.y = Math.max(0, Math.min(JUMP_HEIGHT_Y, playerPosition.y));
+}
+
+function getNearestDroidInDirection(direction) {
+    if (!droids.length) return null;
+
+    const candidates = droids.filter(droid => {
+        const deltaX = droid.position.x - playerPosition.x;
+        return direction > 0 ? deltaX >= 0 : deltaX <= 0;
+    });
+
+    if (!candidates.length) {
+        return null;
+    }
+
+    return candidates.reduce((nearest, candidate) => {
+        const nearestDx = Math.abs(nearest.position.x - playerPosition.x);
+        const candidateDx = Math.abs(candidate.position.x - playerPosition.x);
+        return candidateDx < nearestDx ? candidate : nearest;
+    });
+}
+
+function getNearestDroidDirection() {
+    if (!droids.length) {
+        return 1;
+    }
+
+    const perceivedPlayerPosition = getPerceivedPlayerPosition();
+    let nearestDroid = null;
+    let nearestDistance = Infinity;
+
+    droids.forEach(droid => {
+        const distance = getDistance(droid.position, perceivedPlayerPosition);
+        if (distance < nearestDistance) {
+            nearestDistance = distance;
+            nearestDroid = droid;
+        }
+    });
+
+    if (!nearestDroid) {
+        return 1;
+    }
+
+    return nearestDroid.position.x < perceivedPlayerPosition.x ? -1 : 1;
+}
+
+function announceDroidStatus(message) {
+    if (!droidStatusAnnouncement) return;
+    if (droidStatusAnnouncement.textContent === message) return;
+
+    droidStatusAnnouncement.textContent = '';
+    setTimeout(() => {
+        droidStatusAnnouncement.textContent = message;
+    }, 10);
+}
+
+function updateDroidProximityStatus() {
+    if (!droids.length) {
+        droidProximityState = 'none';
+        lastNearestDroidDistance = null;
+        return;
+    }
+
+    const perceivedPlayerPosition = getPerceivedPlayerPosition();
+    let nearestDistance = Infinity;
+
+    droids.forEach(droid => {
+        nearestDistance = Math.min(nearestDistance, getDistance(droid.position, perceivedPlayerPosition));
+    });
+
+    if (nearestDistance <= DROID_CLOSE_DISTANCE) {
+        if (droidProximityState !== 'close') {
+            announceDroidStatus('Droid is close.');
+            droidProximityState = 'close';
+        }
+    } else if (droidProximityState === 'close') {
+        const movedAwayByDistance = nearestDistance >= DROID_MOVING_AWAY_DISTANCE;
+        const movedAwayByTrend = lastNearestDroidDistance !== null
+            && (nearestDistance - lastNearestDroidDistance) >= DROID_MOVING_AWAY_DELTA;
+
+        if (movedAwayByDistance || movedAwayByTrend) {
+            announceDroidStatus('Droid is moving away.');
+            droidProximityState = 'away';
+        }
+    } else if (droidProximityState === 'away' && nearestDistance <= DROID_CLOSE_DISTANCE) {
+        announceDroidStatus('Droid is close.');
+        droidProximityState = 'close';
+    }
+
+    lastNearestDroidDistance = nearestDistance;
 }
 
 function removeDroid(droid) {
@@ -951,7 +1090,7 @@ function getPerceivedPlayerPosition() {
     if (isJumping) {
         const elapsed = Math.max(0, performance.now() - jumpStartTime);
         const progress = Math.min(1, elapsed / JUMP_AIR_TIME_MS);
-        const jumpTargetX = Math.min(mapWidth, jumpStartX + jumpDistance);
+        const jumpTargetX = Math.max(0, Math.min(mapWidth, jumpStartX + (jumpDistance * jumpDirection)));
         const perceivedX = jumpStartX + ((jumpTargetX - jumpStartX) * progress);
 
         return {
@@ -1039,11 +1178,41 @@ function updateTrackedDroidPanning() {
 // Handle droid movement and actions
 function moveDroid(droid) {
     const now = performance.now();
-    const playerDeltaX = playerPosition.x - droid.position.x;
+    const perceivedPlayerPosition = getPerceivedPlayerPosition();
+    const playerDeltaX = perceivedPlayerPosition.x - droid.position.x;
+    const playerDistanceX = Math.abs(playerDeltaX);
+    const playerIntentDirection = (isMovingLeft && !isMovingRight)
+        ? -1
+        : ((isMovingRight && !isMovingLeft)
+            ? 1
+            : (isJumping ? jumpDirection : 0));
+    const isPlayerMovingSameDirection = playerIntentDirection !== 0 && playerIntentDirection === droid.direction;
+
+    // Help the player clear a nearby droid when jumping toward it.
+    if (isJumping && playerDistanceX <= JUMP_PASS_THROUGH_DISTANCE) {
+        const droidSide = Math.sign(droid.position.x - perceivedPlayerPosition.x);
+        if (droidSide !== 0 && droidSide === jumpDirection) {
+            droid.direction = -jumpDirection;
+            droid.forcedDirectionUntil = now + DROID_POST_PASS_LEFT_MS;
+            droid.evadeLockUntil = now + DROID_JUMP_EVADE_LOCK_MS;
+        }
+    }
+
+    // After pass-through, keep forced direction briefly so droid does not stick/chase immediately.
+    const isForcedDirection = now < droid.forcedDirectionUntil;
+    const isEvadeLocked = now < droid.evadeLockUntil;
+
+    // Discover and lock onto player immediately within close range,
+    // but do not flip direction when player is already moving in the same direction.
+    if (!isForcedDirection && !isEvadeLocked && !isPlayerMovingSameDirection && playerDistanceX <= DROID_DISCOVERY_DISTANCE) {
+        droid.direction = playerDeltaX >= 0 ? 1 : -1;
+        droid.lostTargetStartTime = null;
+    }
+
     const isMovingAwayFromPlayer = (playerDeltaX * droid.direction) < 0;
 
     // Only turn and chase after moving away from the player for a while.
-    if (isMovingAwayFromPlayer) {
+    if (!isForcedDirection && !isEvadeLocked && !isPlayerMovingSameDirection && isMovingAwayFromPlayer) {
         if (droid.lostTargetStartTime === null) {
             droid.lostTargetStartTime = now;
         }
@@ -1056,17 +1225,12 @@ function moveDroid(droid) {
         droid.lostTargetStartTime = null;
     }
 
-    droid.moveProgress += droid.moveSpeed;
-    while (droid.moveProgress >= 1) {
-        const nextX = droid.position.x + droid.direction;
-        if (nextX < 0 || nextX > mapWidth) {
-            // Stop at edge; delayed chase logic will decide if/when to turn around.
-            droid.position.x = Math.max(0, Math.min(mapWidth, droid.position.x));
-            break;
-        }
-
+    const nextX = droid.position.x + (droid.direction * droid.moveSpeed);
+    if (nextX < 0 || nextX > mapWidth) {
+        // Stop at edge; delayed chase logic will decide if/when to turn around.
+        droid.position.x = Math.max(0, Math.min(mapWidth, droid.position.x));
+    } else {
         droid.position.x = nextX;
-        droid.moveProgress -= 1;
     }
 
     // Safety cleanup for invalid coordinates.
@@ -1083,6 +1247,7 @@ function handlePlayerActions(event) {
         case 'ArrowLeft':
             event.preventDefault();
             isMovingLeft = true;
+            lastHorizontalIntent = -1;
             if (event.repeat) {
                 break;
             }
@@ -1094,6 +1259,7 @@ function handlePlayerActions(event) {
         case 'ArrowRight':
             event.preventDefault();
             isMovingRight = true;
+            lastHorizontalIntent = 1;
             if (event.repeat) {
                 break;
             }
@@ -1103,14 +1269,37 @@ function handlePlayerActions(event) {
         case 'ArrowUp': // Use arrow up for jumping only
             if (!isJumping) {
                 isJumping = true;
-                jumpDistance = JUMP_FORWARD_STEPS;
                 jumpStartX = playerPosition.x;
                 jumpStartTime = performance.now();
+                if (isMovingLeft && !isMovingRight) {
+                    jumpDirection = -1;
+                } else if (isMovingRight && !isMovingLeft) {
+                    jumpDirection = 1;
+                } else if (lastHorizontalIntent !== 0) {
+                    jumpDirection = lastHorizontalIntent;
+                } else {
+                    jumpDirection = getNearestDroidDirection();
+                }
+
+                jumpDistance = JUMP_FORWARD_STEPS;
+                const nearestInJumpDirection = getNearestDroidInDirection(jumpDirection);
+                if (nearestInJumpDirection) {
+                    const droidDeltaX = Math.abs(nearestInJumpDirection.position.x - jumpStartX);
+                    if (droidDeltaX <= (JUMP_PASS_THROUGH_DISTANCE + 1)) {
+                        const requiredStepsToClear = Math.ceil(droidDeltaX) + JUMP_EXTRA_CLEARANCE_STEPS;
+                        jumpDistance = Math.max(jumpDistance, requiredStepsToClear);
+                    }
+                }
+
+                playerPosition.y = JUMP_HEIGHT_Y;
+                clampPlayerPosition();
                 playSound(jumpSound);
 
                 // Automatically land after a short airtime.
                 setTimeout(() => {
-                    playerPosition.x = Math.min(mapWidth, jumpStartX + jumpDistance);
+                    playerPosition.x = Math.max(0, Math.min(mapWidth, jumpStartX + (jumpDistance * jumpDirection)));
+                    playerPosition.y = 0;
+                    clampPlayerPosition();
                     jumpDistance = 0;
                     isJumping = false;
                     lastJumpLandTime = performance.now();
@@ -1183,10 +1372,16 @@ function handlePlayerActions(event) {
 function handlePlayerActionsKeyUp(event) {
     if (event.key === 'ArrowLeft') {
         isMovingLeft = false;
+        if (isMovingRight) {
+            lastHorizontalIntent = 1;
+        }
         stopPlayerFootsteps();
     }
     if (event.key === 'ArrowRight') {
         isMovingRight = false;
+        if (isMovingLeft) {
+            lastHorizontalIntent = -1;
+        }
         stopPlayerFootsteps();
     }
     if (event.key === ' ') {
@@ -1197,6 +1392,8 @@ function handlePlayerActionsKeyUp(event) {
 // Droid movement and spawning
 function update() {
     if (!gameRunning) return;
+
+    clampPlayerPosition();
 
     const now = performance.now();
 
@@ -1214,6 +1411,8 @@ function update() {
         droids.forEach(droid => moveDroid(droid));
         lastDroidMoveTime = now;
     }
+
+    updateDroidProximityStatus();
 
     updateTrackedDroidPanning();
 
