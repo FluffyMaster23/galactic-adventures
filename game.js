@@ -30,10 +30,12 @@ let lastSaberSwingTime = -Infinity;
 const INITIAL_DROID_COUNT = 2;
 const MAX_ACTIVE_DROIDS = 2;
 const DROID_SPAWN_INTERVAL_MS = 6000;
-const DROID_MOVE_INTERVAL_MS = 350;
+const DROID_MOVE_INTERVAL_MS = 250;
 const PLAYER_MOVE_INTERVAL_MS = 250;
 const SABER_SWING_COOLDOWN_MS = 550;
 const JUMP_AIR_TIME_MS = 900;
+const JUMP_FORWARD_STEPS = 2;
+const JUMP_DODGE_GRACE_MS = 700;
 const DROID_MIN_FIRE_INTERVAL_MS = 330;
 const DROID_MAX_FIRE_INTERVAL_MS = 850;
 const DROID_BLASTER_RANGE_X = 5;
@@ -41,26 +43,34 @@ const DROID_BLASTER_RANGE_Y = 0;
 const DROID_BLASTER_TRAVEL_FEET = 5;
 const DROID_BLASTER_TRAVEL_MS_PER_FOOT = 120;
 const DROID_STEP_INTERVAL_MS = 720;
-const MIN_SPAWN_DISTANCE_FROM_PLAYER = 20;
+const DROID_BASE_MOVE_SPEED = 1;
+const DROID_FIRST_HUNTER_SPEED = 1.05;
+const DROID_CHASE_DELAY_MS = 9000;
+const MIN_SPAWN_DISTANCE_FROM_PLAYER = 12;
 const MIN_SPAWN_DISTANCE_BETWEEN_DROIDS = 10;
 const ORIGIN_NO_SPAWN_RADIUS = 12;
 const INITIAL_FRONT_SPAWN_BLOCK_Y = 8;
 const MIN_DROID_SPAWN_X = 10;
 const FOOTSTEP_PAN_AMOUNT = 1;
-const STEREO_MAX_DISTANCE = 6;
-const STEREO_PAN_STRENGTH = 3;
-const STEREO_HARD_PAN_THRESHOLD = 1.5;
+const STEREO_MAX_DISTANCE = 10;
+const DROID_VOICE_MIN_VOLUME = 0.28;
+const DROID_VOICE_BOOST = 2;
+// Disabled by default: HTMLMediaElement playback can be blocked for timer/spawn sounds.
+const ENABLE_NATIVE_SPATIAL_FALLBACK = false;
 const droidApproachMix = {
-    minVolume: 0.02,
-    blasterMinVolume: 0.08,
-    distanceRange: 16,
-    fadeOutRange: 18,
-    droidBoost: 1,
-    blasterBoost: 1.2
+    minVolume: 0.08,
+    blasterMinVolume: 0.15,
+    distanceRange: 28,
+    fadeOutRange: 24,
+    droidBoost: 1.4,
+    blasterBoost: 1.4
 };
 const deathMessage = document.createElement('div');
 const coordAnnouncement = document.createElement('div'); // Coordinate display element
 let jumpDistance = 0; // Track how many steps to move during a jump
+let lastJumpLandTime = -Infinity;
+let jumpStartTime = 0;
+let jumpStartX = 0;
 const menuElement = document.getElementById('menu');
 const menuAnnouncement = document.getElementById('menu-announcement');
 const menuModel = {
@@ -98,8 +108,8 @@ const saberHitSounds = [
 ];
 const droidSpawnSound = new Howl({ src: ['sounds/enemies/droid/roger.WAV'], preload: true });
 const droidStepSounds = [
-    new Howl({ src: ['sounds/enemies/droid/droidstep1.wav'], preload: true }),
-    new Howl({ src: ['sounds/enemies/droid/droidstep2.wav'], preload: true })
+    new Howl({ src: ['sounds/enemies/droid/droidstep1.ogg'], preload: true }),
+    new Howl({ src: ['sounds/enemies/droid/droidstep2.ogg'], preload: true })
 ];
 const droidHitSound = new Howl({ src: ['sounds/enemies/droid/roger.WAV'], preload: true });
 const droidDeath1Sound = new Howl({ src: ['sounds/deaths/droid/droiddeath.WAV'], preload: true });
@@ -127,6 +137,7 @@ const menuBackSound = new Howl({ src: ['sounds/UI/MENUBACK.WAV'], preload: true 
 const menuNoEntrySound = new Howl({ src: ['sounds/UI/MENUNOENTRY.WAV'], preload: true });
 let saberLoopId = null;
 let activeSpatialAudioInstances = [];
+let ownedNativeAudioContext = null;
 
 const allSounds = [
     ...footstepsSounds,
@@ -167,29 +178,204 @@ function playSound(sound, restart = true) {
 }
 
 function stopTrackedSound(playback) {
-    if (!playback || !playback.sound || playback.id === null || playback.id === undefined) {
+    if (!playback) {
+        return;
+    }
+
+    if (playback.engine === 'native') {
+        if (playback.audio) {
+            playback.audio.pause();
+            playback.audio.currentTime = 0;
+        }
+
+        if (playback.sourceNode) playback.sourceNode.disconnect();
+        if (playback.gainNode) playback.gainNode.disconnect();
+        if (playback.pannerNode) playback.pannerNode.disconnect();
+        return;
+    }
+
+    if (!playback.sound || playback.id === null || playback.id === undefined) {
         return;
     }
 
     playback.sound.stop(playback.id);
 }
 
+function getSharedAudioContext() {
+    if (Howler && Howler.ctx) {
+        return Howler.ctx;
+    }
+
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) {
+        return null;
+    }
+
+    if (!ownedNativeAudioContext) {
+        ownedNativeAudioContext = new AudioCtx();
+    }
+
+    return ownedNativeAudioContext;
+}
+
+function getHowlSourcePath(sound) {
+    if (!sound) return null;
+    if (typeof sound._src === 'string') return sound._src;
+    if (Array.isArray(sound._src) && sound._src.length) return sound._src[0];
+    return null;
+}
+
+function canUseNativeSpatialPlayback() {
+    if (!ENABLE_NATIVE_SPATIAL_FALLBACK) {
+        return false;
+    }
+
+    const ctx = getSharedAudioContext();
+    return !!(ctx && typeof ctx.createStereoPanner === 'function');
+}
+
+function createNativeSpatialPlayback(sound, position, options = {}) {
+    const ctx = getSharedAudioContext();
+    const srcPath = getHowlSourcePath(sound);
+    if (!ctx || !srcPath) {
+        return null;
+    }
+
+    const {
+        loop = false,
+        playbackRate = 1,
+        volumeMultiplier = 1,
+        minVolumeFloor = 0,
+        droid = null,
+        track = true
+    } = options;
+
+    const audio = new Audio(srcPath);
+    audio.preload = 'auto';
+    audio.loop = loop;
+    audio.playbackRate = playbackRate;
+
+    const sourceNode = ctx.createMediaElementSource(audio);
+    const gainNode = ctx.createGain();
+    const pannerNode = ctx.createStereoPanner();
+
+    sourceNode.connect(gainNode);
+    gainNode.connect(pannerNode);
+    pannerNode.connect(ctx.destination);
+
+    const playback = {
+        engine: 'native',
+        sound,
+        id: null,
+        audio,
+        sourceNode,
+        gainNode,
+        pannerNode,
+        position,
+        droid,
+        options: { volumeMultiplier, minVolumeFloor }
+    };
+
+    updateTrackedSound(playback, position, { volumeMultiplier, minVolumeFloor });
+
+    if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+    }
+
+    audio.play().catch(() => {});
+
+    if (track) {
+        activeSpatialAudioInstances.push(playback);
+    } else {
+        audio.addEventListener('ended', () => stopTrackedSound(playback), { once: true });
+    }
+
+    return playback;
+}
+
+function playOneShotPanned(sound, pan, volume = 1) {
+    const clampedPan = Math.max(-1, Math.min(1, pan));
+
+    if (canUseNativeSpatialPlayback()) {
+        const ctx = getSharedAudioContext();
+        const srcPath = getHowlSourcePath(sound);
+        if (ctx && srcPath) {
+            const audio = new Audio(srcPath);
+            const sourceNode = ctx.createMediaElementSource(audio);
+            const gainNode = ctx.createGain();
+            const pannerNode = ctx.createStereoPanner();
+
+            gainNode.gain.value = volume;
+            pannerNode.pan.value = clampedPan;
+
+            sourceNode.connect(gainNode);
+            gainNode.connect(pannerNode);
+            pannerNode.connect(ctx.destination);
+
+            if (ctx.state === 'suspended') {
+                ctx.resume().catch(() => {});
+            }
+
+            audio.play().catch(() => {});
+            audio.addEventListener('ended', () => {
+                sourceNode.disconnect();
+                gainNode.disconnect();
+                pannerNode.disconnect();
+            }, { once: true });
+
+            return null;
+        }
+    }
+
+    const id = playSound(sound);
+    if (id !== null && typeof sound.stereo === 'function') {
+        sound.stereo(clampedPan, id);
+    }
+
+    return id;
+}
+
 function updateTrackedSound(playback, position, options = {}) {
-    if (!playback || !playback.sound || playback.id === null || playback.id === undefined) {
+    if (!playback || !position) {
         return;
     }
 
     const { volumeMultiplier = 1, minVolumeFloor = 0 } = options;
-    playback.sound.volume(getVolumeForPosition(position, { volumeMultiplier, minVolumeFloor }), playback.id);
-
+    const spatialVolume = getVolumeForPosition(position, { volumeMultiplier, minVolumeFloor });
     const pan = getPanForPosition(position);
+
+    if (playback.engine === 'native') {
+        if (playback.gainNode) {
+            playback.gainNode.gain.value = spatialVolume;
+        }
+        if (playback.pannerNode) {
+            playback.pannerNode.pan.value = pan;
+        }
+        return;
+    }
+
+    if (!playback.sound || playback.id === null || playback.id === undefined) {
+        return;
+    }
+
+    playback.sound.volume(spatialVolume, playback.id);
+
     if (typeof playback.sound.stereo === 'function') {
         playback.sound.stereo(pan, playback.id);
     }
 }
 
 function playSpatialSoundAtPosition(sound, position, options = {}) {
-    if (!sound) return null;
+    if (!sound || !position) {
+        return null;
+    }
+
+    if (canUseNativeSpatialPlayback()) {
+        const nativePlayback = createNativeSpatialPlayback(sound, position, options);
+        if (nativePlayback) {
+            return nativePlayback;
+        }
+    }
 
     const {
         loop = false,
@@ -199,15 +385,39 @@ function playSpatialSoundAtPosition(sound, position, options = {}) {
         track = true,
         droid = null
     } = options;
+
+    const pan = getPanForPosition(position);
+    const volume = getVolumeForPosition(position, {
+        volumeMultiplier,
+        minVolumeFloor
+    });
+
+    // Set defaults before starting playback.
+    if (typeof sound.stereo === 'function') {
+        sound.stereo(pan);
+    }
+    sound.volume(volume);
+    sound.loop(loop);
+    sound.rate(playbackRate);
+
     const id = sound.play();
 
     if (id === null || id === undefined) {
         return null;
     }
 
+    // Set the exact playing instance too.
+    if (typeof sound.stereo === 'function') {
+        sound.stereo(pan, id);
+    }
+    sound.volume(volume, id);
     sound.loop(loop, id);
     sound.rate(playbackRate, id);
-    updateTrackedSound({ sound, id }, position, { volumeMultiplier, minVolumeFloor });
+
+    console.log(
+        `Spatial sound: playerX=${getPerceivedPlayerPosition().x}, ` +
+        `soundX=${position.x}, pan=${pan}, id=${id}`
+    );
 
     if (track) {
         activeSpatialAudioInstances.push({
@@ -239,83 +449,43 @@ function stopSaberLoop() {
     saberLoopSound.stop();
 }
 
-function getStereoDiagnostics() {
-    const hasHowlerStereo = typeof menuMoveSound.stereo === 'function';
-    const hasWebAudio = !!(window.AudioContext || window.webkitAudioContext);
-    const destinationChannels = hasWebAudio && Howler && Howler.ctx && Howler.ctx.destination
-        ? Howler.ctx.destination.maxChannelCount
-        : 0;
+function getOutputChannelCount() {
+    const ctx = getSharedAudioContext();
+    if (!ctx || !ctx.destination) {
+        return 'unknown';
+    }
 
-    return {
-        hasHowlerStereo,
-        hasWebAudio,
-        destinationChannels
-    };
+    const maxChannels = typeof ctx.destination.maxChannelCount === 'number' ? ctx.destination.maxChannelCount : 0;
+    const activeChannels = typeof ctx.destination.channelCount === 'number' ? ctx.destination.channelCount : 0;
+    const channels = Math.max(maxChannels, activeChannels);
+
+    return channels > 0 ? channels : 'unknown';
 }
 
-function playNativeStereoPulse(pan, startDelayMs = 0) {
-    const AudioCtx = window.AudioContext || window.webkitAudioContext;
-    if (!AudioCtx) {
+function playStereoTestBlaster(pan, volume = 0.95) {
+    const id = blasterFireSound.play();
+    if (id === null || id === undefined) {
         return false;
     }
 
-    const ctx = Howler && Howler.ctx ? Howler.ctx : new AudioCtx();
-    const now = ctx.currentTime;
-    const startTime = now + (startDelayMs / 1000);
-    const duration = 0.18;
-
-    const oscillator = ctx.createOscillator();
-    oscillator.type = 'square';
-    oscillator.frequency.setValueAtTime(660, startTime);
-
-    const gain = ctx.createGain();
-    gain.gain.setValueAtTime(0.0001, startTime);
-    gain.gain.exponentialRampToValueAtTime(0.28, startTime + 0.01);
-    gain.gain.exponentialRampToValueAtTime(0.0001, startTime + duration);
-
-    const panner = ctx.createStereoPanner();
-    panner.pan.setValueAtTime(pan, startTime);
-
-    oscillator.connect(gain);
-    gain.connect(panner);
-    panner.connect(ctx.destination);
-
-    oscillator.start(startTime);
-    oscillator.stop(startTime + duration + 0.02);
+    blasterFireSound.volume(volume, id);
+    if (typeof blasterFireSound.stereo === 'function') {
+        blasterFireSound.stereo(Math.max(-1, Math.min(1, pan)), id);
+    }
 
     return true;
 }
-
 function playStereoTestTone() {
-    const diagnostics = getStereoDiagnostics();
+    const channels = getOutputChannelCount();
+    const testPans = [-0.65, -0.35, 0, 0.35, 0.65];
 
-    if (diagnostics.hasWebAudio) {
-        const leftPlayed = playNativeStereoPulse(-1, 0);
-        const rightPlayed = playNativeStereoPulse(1, 300);
+    testPans.forEach((pan, index) => {
+        setTimeout(() => {
+            playStereoTestBlaster(pan, 0.95);
+        }, index * 280);
+    });
 
-        if (leftPlayed && rightPlayed) {
-            announceMenu(`Stereo test: left then right. Output channels: ${diagnostics.destinationChannels || 'unknown'}`);
-            return;
-        }
-    }
-
-    // Fallback path if Web Audio stereo is unavailable.
-    const testSound = menuMoveSound;
-    const leftId = testSound.play();
-    if (leftId !== null && leftId !== undefined && typeof testSound.stereo === 'function') {
-        testSound.volume(0.7, leftId);
-        testSound.stereo(-1, leftId);
-    }
-
-    setTimeout(() => {
-        const rightId = testSound.play();
-        if (rightId !== null && rightId !== undefined && typeof testSound.stereo === 'function') {
-            testSound.volume(0.7, rightId);
-            testSound.stereo(1, rightId);
-        }
-    }, 300);
-
-    announceMenu(`Stereo test fallback. WebAudio: ${diagnostics.hasWebAudio ? 'on' : 'off'}, Howler stereo: ${diagnostics.hasHowlerStereo ? 'on' : 'off'}`);
+    announceMenu(`Linear stereo test: -0.65, -0.35, 0, 0.35, 0.65. Output channels: ${channels}`);
 }
 
 // Update health display
@@ -542,16 +712,12 @@ document.addEventListener('keydown', (event) => {
     }
 });
 
-// Play exactly one footstep per movement step.
-function getPlayerFootstepPan() {
-    return footstepIndex % 2 === 0 ? -FOOTSTEP_PAN_AMOUNT : FOOTSTEP_PAN_AMOUNT;
-}
-
+// Play exactly one centered footstep per movement step.
 function playPlayerFootstepStep() {
     const sound = footstepsSounds[footstepIndex % 2];
     const id = playSound(sound);
     if (id !== null && typeof sound.stereo === 'function') {
-        sound.stereo(getPlayerFootstepPan(), id);
+        sound.stereo(0, id);
     }
     footstepIndex++;
 }
@@ -574,8 +740,6 @@ function movePlayerStep(direction) {
         if (!isJumping) {
             playerPosition.x = Math.min(mapWidth, playerPosition.x + 1);
             playPlayerFootstepStep();
-        } else {
-            jumpDistance++;
         }
     }
 }
@@ -641,23 +805,34 @@ function spawnDroid(options = {}) {
         health: isBoss ? 2 : 1,
         isBoss,
         stepSound,
-        stepLoop: null
+        stepLoop: null,
+        direction: -1,
+        moveProgress: 0,
+        moveSpeed: totalDroidsSpawned === 1 ? DROID_FIRST_HUNTER_SPEED : DROID_BASE_MOVE_SPEED,
+        lostTargetStartTime: null
     };
     droids.push(droid);
 
-    playSpatialSoundAtPosition(droidSpawnSound, droid.position, { volumeMultiplier: droidApproachMix.droidBoost });
+    playSpatialSoundAtPosition(droidSpawnSound, droid.position, {
+        volumeMultiplier: droidApproachMix.droidBoost * DROID_VOICE_BOOST,
+        minVolumeFloor: DROID_VOICE_MIN_VOLUME
+    });
 
     if (droid.stepSound) {
         droid.stepLoop = playSpatialSoundAtPosition(droid.stepSound, droid.position, {
             loop: true,
             playbackRate: 1,
             volumeMultiplier: droidApproachMix.droidBoost,
+            minVolumeFloor: droidApproachMix.minVolume,
             droid
         });
     }
 
     if (droid.isBoss) {
-        playSpatialSoundAtPosition(droidDeath2Sound, droid.position, { volumeMultiplier: droidApproachMix.droidBoost });
+        playSpatialSoundAtPosition(droidDeath2Sound, droid.position, {
+            volumeMultiplier: droidApproachMix.droidBoost,
+            minVolumeFloor: droidApproachMix.minVolume
+        });
     }
 
     droidFireAtRandom(droid); // Make this droid fire at random intervals
@@ -680,8 +855,8 @@ function removeDroid(droid) {
 }
 
 function applyDroidBlasterImpact(droid) {
-    // Jumping creates a dodge window for incoming blaster shots.
-    if (isJumping) {
+    // Jumping (plus a short landing grace window) creates a dodge window for incoming blaster shots.
+    if (isJumping || (performance.now() - lastJumpLandTime) <= JUMP_DODGE_GRACE_MS) {
         return;
     }
 
@@ -724,18 +899,24 @@ function droidFireAtRandom(droid) {
     const fireInterval = randomInRange(DROID_MIN_FIRE_INTERVAL_MS, DROID_MAX_FIRE_INTERVAL_MS);
     droid.fireInterval = setInterval(() => {
         if (!gameRunning) return;
-        if (Math.abs(droid.position.x - playerPosition.x) <= DROID_BLASTER_RANGE_X && Math.abs(droid.position.y - playerPosition.y) <= DROID_BLASTER_RANGE_Y) {
+
+        // Let jumps be a real dodge mechanic by pausing incoming fire while airborne.
+        if (isJumping) return;
+
+        const targetPosition = getPerceivedPlayerPosition();
+        if (Math.abs(droid.position.x - targetPosition.x) <= DROID_BLASTER_RANGE_X && Math.abs(droid.position.y - targetPosition.y) <= DROID_BLASTER_RANGE_Y) {
             playSpatialSoundAtPosition(blasterFireSound, droid.position, {
                 volumeMultiplier: droidApproachMix.blasterBoost,
                 minVolumeFloor: droidApproachMix.blasterMinVolume
             });
 
-            const travelFeet = Math.min(DROID_BLASTER_TRAVEL_FEET, getDistance(droid.position, playerPosition));
+            const travelFeet = Math.min(DROID_BLASTER_TRAVEL_FEET, getDistance(droid.position, targetPosition));
             const impactDelayMs = Math.max(90, Math.floor(travelFeet * DROID_BLASTER_TRAVEL_MS_PER_FOOT));
 
             setTimeout(() => {
                 if (!gameRunning) return;
                 if (!droids.includes(droid)) return;
+                if (isJumping) return;
                 applyDroidBlasterImpact(droid);
             }, impactDelayMs);
         }
@@ -767,8 +948,20 @@ function startSpawningDroids() {
 }
 
 function getPerceivedPlayerPosition() {
+    if (isJumping) {
+        const elapsed = Math.max(0, performance.now() - jumpStartTime);
+        const progress = Math.min(1, elapsed / JUMP_AIR_TIME_MS);
+        const jumpTargetX = Math.min(mapWidth, jumpStartX + jumpDistance);
+        const perceivedX = jumpStartX + ((jumpTargetX - jumpStartX) * progress);
+
+        return {
+            x: perceivedX,
+            y: playerPosition.y
+        };
+    }
+
     return {
-        x: isJumping ? Math.min(mapWidth, playerPosition.x + jumpDistance) : playerPosition.x,
+        x: playerPosition.x,
         y: playerPosition.y
     };
 }
@@ -781,26 +974,14 @@ function getRelativePositionToPlayer(objectPosition) {
     };
 }
 
-function calculatePan(listenerX, soundX, maximumDistance = STEREO_MAX_DISTANCE) {
+function calculatePan(listenerX, soundX) {
     const relativeX = soundX - listenerX;
-
-    if (relativeX >= STEREO_HARD_PAN_THRESHOLD) {
-        return 1;
-    }
-    if (relativeX <= -STEREO_HARD_PAN_THRESHOLD) {
-        return -1;
-    }
-
-    const normalized = Math.max(-1, Math.min(1, relativeX / maximumDistance));
-    // Non-linear shaping pushes moderate offsets further into the side channels.
-    let pan = Math.sign(normalized) * Math.pow(Math.abs(normalized), 0.65) * STEREO_PAN_STRENGTH;
-
-    return Math.max(-1, Math.min(1, pan));
+    return Math.max(-1, Math.min(1, relativeX / STEREO_MAX_DISTANCE));
 }
 
 function getPanForPosition(position) {
-    const perceivedPlayerPosition = getPerceivedPlayerPosition();
-    return calculatePan(perceivedPlayerPosition.x, position.x);
+    const playerX = getPerceivedPlayerPosition().x;
+    return calculatePan(playerX, position.x);
 }
 
 function getDroidPan(droid) {
@@ -831,7 +1012,12 @@ function updateTrackedDroidPanning() {
     if (!activeSpatialAudioInstances.length) return;
 
     activeSpatialAudioInstances = activeSpatialAudioInstances.filter(entry => {
-        if (!entry.sound.playing(entry.id)) {
+        if (entry.engine === 'native') {
+            if (!entry.audio || (entry.audio.ended && !entry.audio.loop)) {
+                stopTrackedSound(entry);
+                return false;
+            }
+        } else if (!entry.sound.playing(entry.id)) {
             return false;
         }
 
@@ -852,13 +1038,39 @@ function updateTrackedDroidPanning() {
 
 // Handle droid movement and actions
 function moveDroid(droid) {
-    // Side-scroller movement: droids walk from right to left across the world.
-    droid.position.x -= 1;
+    const now = performance.now();
+    const playerDeltaX = playerPosition.x - droid.position.x;
+    const isMovingAwayFromPlayer = (playerDeltaX * droid.direction) < 0;
 
-    // Check if droid falls into the abyss
-    if (droid.position.x < Math.max(-1, playerPosition.x - 6) || droid.position.x > mapWidth || droid.position.y < 0 || droid.position.y > mapHeight) {
-        const deathSoundPath = droid.isBoss ? droidDeath2Sound : droidDeath1Sound;
-        playSpatialSoundAtPosition(deathSoundPath, { ...droid.position }, { volumeMultiplier: droidApproachMix.droidBoost });
+    // Only turn and chase after moving away from the player for a while.
+    if (isMovingAwayFromPlayer) {
+        if (droid.lostTargetStartTime === null) {
+            droid.lostTargetStartTime = now;
+        }
+
+        if ((now - droid.lostTargetStartTime) >= DROID_CHASE_DELAY_MS) {
+            droid.direction = playerDeltaX >= 0 ? 1 : -1;
+            droid.lostTargetStartTime = null;
+        }
+    } else {
+        droid.lostTargetStartTime = null;
+    }
+
+    droid.moveProgress += droid.moveSpeed;
+    while (droid.moveProgress >= 1) {
+        const nextX = droid.position.x + droid.direction;
+        if (nextX < 0 || nextX > mapWidth) {
+            // Stop at edge; delayed chase logic will decide if/when to turn around.
+            droid.position.x = Math.max(0, Math.min(mapWidth, droid.position.x));
+            break;
+        }
+
+        droid.position.x = nextX;
+        droid.moveProgress -= 1;
+    }
+
+    // Safety cleanup for invalid coordinates.
+    if (droid.position.y < 0 || droid.position.y > mapHeight) {
         removeDroid(droid);
     }
 }
@@ -891,14 +1103,17 @@ function handlePlayerActions(event) {
         case 'ArrowUp': // Use arrow up for jumping only
             if (!isJumping) {
                 isJumping = true;
-                jumpDistance = 0; // Reset the jump distance counter
+                jumpDistance = JUMP_FORWARD_STEPS;
+                jumpStartX = playerPosition.x;
+                jumpStartTime = performance.now();
                 playSound(jumpSound);
 
                 // Automatically land after a short airtime.
                 setTimeout(() => {
-                    playerPosition.x = Math.min(mapWidth, playerPosition.x + jumpDistance); // Move the player based on jump distance
-                    jumpDistance = 0; // Reset the jump distance counter
+                    playerPosition.x = Math.min(mapWidth, jumpStartX + jumpDistance);
+                    jumpDistance = 0;
                     isJumping = false;
+                    lastJumpLandTime = performance.now();
                     playSound(landSound); // Play landing sound
                 }, JUMP_AIR_TIME_MS);
             }
@@ -933,16 +1148,26 @@ function handlePlayerActions(event) {
                     if (Math.abs(droid.position.x - playerPosition.x) <= 5 && Math.abs(droid.position.y - playerPosition.y) <= 5) {
                         // Play saber hit sound and then check if the droid is hit
                         const hitSoundPath = saberHitSounds[Math.floor(Math.random() * saberHitSounds.length)];
-                        playSpatialSoundAtPosition(hitSoundPath, { ...droid.position }, { volumeMultiplier: droidApproachMix.droidBoost });
+                        playSpatialSoundAtPosition(
+                            hitSoundPath,
+                            droid.position,
+                            { volumeMultiplier: droidApproachMix.droidBoost }
+                        );
                         setTimeout(() => {
                             droid.health -= 1;
                             droidHit = true;
                             if (droid.health === 1) {
-                                playSpatialSoundAtPosition(droidHitSound, droid.position, { volumeMultiplier: droidApproachMix.droidBoost });
+                                playSpatialSoundAtPosition(droidHitSound, droid.position, {
+                                    volumeMultiplier: droidApproachMix.droidBoost * DROID_VOICE_BOOST,
+                                    minVolumeFloor: DROID_VOICE_MIN_VOLUME
+                                });
                             }
                             if (droid.health <= 0) {
                                 const deathSoundPath = droid.isBoss ? droidDeath2Sound : droidDeath1Sound;
-                                playSpatialSoundAtPosition(deathSoundPath, { ...droid.position }, { volumeMultiplier: droidApproachMix.droidBoost });
+                                playSpatialSoundAtPosition(deathSoundPath, { ...droid.position }, {
+                                    volumeMultiplier: droidApproachMix.droidBoost,
+                                    minVolumeFloor: droidApproachMix.minVolume
+                                });
                                 totalDroidsKilled += 1;
                                 removeDroid(droid);
                             }
