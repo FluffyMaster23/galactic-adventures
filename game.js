@@ -48,7 +48,8 @@ const INITIAL_FRONT_SPAWN_BLOCK_Y = 8;
 const MIN_DROID_SPAWN_X = 10;
 const FOOTSTEP_PAN_AMOUNT = 1;
 const STEREO_MAX_DISTANCE = 10;
-const SPATIAL_AUDIO_WORLD_SCALE = 3;
+const STEREO_PAN_STRENGTH = 2.25;
+const STEREO_RIGHT_BIAS = 0.35;
 const droidApproachMix = {
     minVolume: 0.12,
     blasterMinVolume: 0.35,
@@ -173,16 +174,6 @@ function stopTrackedSound(playback) {
     playback.sound.stop(playback.id);
 }
 
-function getSpatialPointForPosition(position) {
-    const { dx, dy } = getRelativePositionToPlayer(position);
-    // Keep distance attenuation on the forward axis while preserving horizontal panning.
-    return {
-        x: dx / SPATIAL_AUDIO_WORLD_SCALE,
-        y: 0,
-        z: -Math.abs(dy / SPATIAL_AUDIO_WORLD_SCALE)
-    };
-}
-
 function updateTrackedSound(playback, position, options = {}) {
     if (!playback || !playback.sound || playback.id === null || playback.id === undefined) {
         return;
@@ -194,11 +185,6 @@ function updateTrackedSound(playback, position, options = {}) {
     const pan = getPanForPosition(position);
     if (typeof playback.sound.stereo === 'function') {
         playback.sound.stereo(pan, playback.id);
-    }
-
-    if (typeof playback.sound.pos === 'function') {
-        const point = getSpatialPointForPosition(position);
-        playback.sound.pos(point.x, point.y, point.z, playback.id);
     }
 }
 
@@ -503,7 +489,9 @@ function getDynamicDroidPopulationTarget() {
 }
 
 function isDirectlyInFrontOfPlayer(position) {
-    return position.x > playerPosition.x && Math.abs(position.y - playerPosition.y) <= INITIAL_FRONT_SPAWN_BLOCK_Y;
+    // Only block spawns immediately ahead of the player, not all right-side spawns.
+    const deltaX = position.x - playerPosition.x;
+    return deltaX > 0 && deltaX <= INITIAL_FRONT_SPAWN_BLOCK_Y;
 }
 
 // Function to prevent droids from piling up and ensure unique random positions
@@ -697,7 +685,13 @@ function getRelativePositionToPlayer(objectPosition) {
 
 function calculatePan(listenerX, soundX, maximumDistance = STEREO_MAX_DISTANCE) {
     const relativeX = soundX - listenerX;
-    return Math.max(-1, Math.min(1, relativeX / maximumDistance));
+    let pan = (relativeX / maximumDistance) * STEREO_PAN_STRENGTH;
+
+    if (relativeX > 0) {
+        pan += STEREO_RIGHT_BIAS;
+    }
+
+    return Math.max(-1, Math.min(1, pan));
 }
 
 function getPanForPosition(position) {
